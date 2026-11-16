@@ -32,12 +32,27 @@ jobs:
       MACOSX_DEPLOYMENT_TARGET: '10.14'
     steps:
       - uses: actions/checkout@v7
-      - name: Set up Python
-        uses: actions/setup-python@v7
-        with:
-          python-version: 3.11
-          check-latest: true
-          cache: 'pip'
+      - name: Install official Python ${{ env.PYTHON_VERSION }} from python.org
+        # actions/setup-python's Python links the system libffi in its
+        # _ctypes module, which references ffi_closure_alloc (absent on
+        # 10.14) and fails this build's verification gate. The official
+        # python.org build is what this recipe always intended to use.
+        run: |
+          curl -L -o python.pkg "https://www.python.org/ftp/python/${PYTHON_VERSION}/python-${PYTHON_VERSION}-macos11.pkg"
+          sudo installer -pkg python.pkg -target /
+          echo "/Library/Frameworks/Python.framework/Versions/3.11/bin" >> "$GITHUB_PATH"
+      - name: Verify the official Python's _ctypes is 10.14-safe
+        run: |
+          export PATH="/Library/Frameworks/Python.framework/Versions/3.11/bin:$PATH"
+          python3 --version
+          CTYPES=$(python3 -c "import _ctypes; print(_ctypes.__file__)")
+          echo "_ctypes: $CTYPES"
+          otool -L "$CTYPES"
+          if nm -u "$CTYPES" | grep -q "ffi_closure_alloc"; then
+            echo "::error::official Python _ctypes still references ffi_closure_alloc"
+            exit 1
+          fi
+          echo "_ctypes is clean"
       - name: Build libffi from source (static, 10.14 target)
         # The prebuilt cffi wheel links /usr/lib/libffi.dylib and references
         # ffi_closure_alloc, which does not exist in macOS 10.14's libffi, so
