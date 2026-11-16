@@ -41,18 +41,6 @@ jobs:
           curl -L -o python.pkg "https://www.python.org/ftp/python/${PYTHON_VERSION}/python-${PYTHON_VERSION}-macos11.pkg"
           sudo installer -pkg python.pkg -target /
           echo "/Library/Frameworks/Python.framework/Versions/3.11/bin" >> "$GITHUB_PATH"
-      - name: Verify the official Python's _ctypes is 10.14-safe
-        run: |
-          export PATH="/Library/Frameworks/Python.framework/Versions/3.11/bin:$PATH"
-          python3 --version
-          CTYPES=$(python3 -c "import _ctypes; print(_ctypes.__file__)")
-          echo "_ctypes: $CTYPES"
-          otool -L "$CTYPES"
-          if nm -u "$CTYPES" | grep -q "ffi_closure_alloc"; then
-            echo "::error::official Python _ctypes still references ffi_closure_alloc"
-            exit 1
-          fi
-          echo "_ctypes is clean"
       - name: Build libffi from source (static, 10.14 target)
         # The prebuilt cffi wheel links /usr/lib/libffi.dylib and references
         # ffi_closure_alloc, which does not exist in macOS 10.14's libffi, so
@@ -66,6 +54,32 @@ jobs:
           make -j3
           make install
           ls -la "$RUNNER_TEMP/libffi/lib" "$RUNNER_TEMP/libffi/include"
+      - name: Rebuild _ctypes against the in-job libffi
+        # Both GitHub's and python.org's Python ship a _ctypes module that
+        # links the system libffi and references ffi_closure_alloc (run #2
+        # proved this for the official build too). Rebuild the module from
+        # the matching CPython source against our static libffi and install
+        # it over the bundled one.
+        env:
+          PKG_CONFIG_PATH: ${{ runner.temp }}/libffi/lib/pkgconfig
+        run: |
+          curl -L -o python-src.tgz "https://www.python.org/ftp/python/${PYTHON_VERSION}/Python-${PYTHON_VERSION}.tgz"
+          tar xzf python-src.tgz
+          cd "Python-${PYTHON_VERSION}"
+          export CPPFLAGS="-I$RUNNER_TEMP/libffi/include"
+          export LDFLAGS="-L$RUNNER_TEMP/libffi/lib"
+          ./configure --prefix="$RUNNER_TEMP/pybuild" --with-system-ffi
+          make -j3
+          BUILT=$(find . -name "_ctypes.cpython-311-darwin.so" | head -1)
+          echo "built _ctypes: $BUILT"
+          if nm -u "$BUILT" | grep -q "ffi_closure_alloc"; then
+            echo "::error::rebuilt _ctypes still references ffi_closure_alloc"
+            exit 1
+          fi
+          TARGET=$(python3 -c "import _ctypes; print(_ctypes.__file__)")
+          echo "installing over: $TARGET"
+          sudo cp "$BUILT" "$TARGET"
+          python3 -c "import ctypes; print('ctypes import OK')"
       - name: Install Python dependencies
         # Legacy macOS needs Python 3.11, so this emudhra workaround is needed
         run: |
