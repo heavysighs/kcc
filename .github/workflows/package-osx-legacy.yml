@@ -38,14 +38,54 @@ jobs:
           python-version: 3.11
           check-latest: true
           cache: 'pip'
+      - name: Build libffi from source (static, 10.14 target)
+        # The prebuilt cffi wheel links /usr/lib/libffi.dylib and references
+        # ffi_closure_alloc, which does not exist in macOS 10.14's libffi, so
+        # the frozen app crashes on 10.14 before the GUI loads. Building our
+        # own static libffi lets the cffi backend carry the code itself.
+        run: |
+          curl -L -o libffi.tar.gz https://github.com/libffi/libffi/releases/download/v3.4.6/libffi-3.4.6.tar.gz
+          tar xzf libffi.tar.gz
+          cd libffi-3.4.6
+          ./configure --prefix="$RUNNER_TEMP/libffi" --includedir="$RUNNER_TEMP/libffi/include" --disable-shared --enable-static CFLAGS="-mmacosx-version-min=10.14"
+          make -j3
+          make install
+          ls -la "$RUNNER_TEMP/libffi/lib" "$RUNNER_TEMP/libffi/include"
       - name: Install Python dependencies
         # Legacy macOS needs Python 3.11, so this emudhra workaround is needed
         run: |
           python3 --version
           python3 -m pip install "pip @ https://files.pythonhosted.org/packages/3f/06/3e4420302363fbb71be3c7f35ce042f54bfca330e3e66b3a2e3c4cca579f/pip-26.2.2-py3-none-any.whl#sha256=fd7f4dfa8190e014013b9f08f3e973f4e4c26ffd179a204895533a7254813a70"
           pip3 install --upgrade pip certifi pyinstaller
+      - name: Build cffi from source against the in-job libffi
+        env:
+          PKG_CONFIG_PATH: ${{ runner.temp }}/libffi/lib/pkgconfig
+          CFLAGS: -I${{ runner.temp }}/libffi/include
+          LDFLAGS: -L${{ runner.temp }}/libffi/lib
+        run: |
+          command -v pkg-config || brew install pkg-config
+          pip3 install --no-binary cffi cffi
+          BACKEND=$(python3 -c "import _cffi_backend; print(_cffi_backend.__file__)")
+          echo "cffi backend: $BACKEND"
+          otool -L "$BACKEND"
+          if nm -u "$BACKEND" | grep -q "ffi_closure_alloc"; then
+            echo "::error::cffi backend still references ffi_closure_alloc as an external symbol"
+            exit 1
+          fi
+          if otool -L "$BACKEND" | grep -q "/usr/lib/libffi"; then
+            echo "::error::cffi backend still links the system libffi"
+            exit 1
+          fi
+          echo "cffi backend is self-contained"
+      - name: Install remaining Python dependencies
+        run: |
           pip3 install --upgrade -r requirements-osx-legacy.txt
           ./gen_ui_files.sh
+          BACKEND=$(python3 -c "import _cffi_backend; print(_cffi_backend.__file__)")
+          if nm -u "$BACKEND" | grep -q "ffi_closure_alloc"; then
+            echo "::error::cffi was replaced by a prebuilt wheel during requirements install"
+            exit 1
+          fi
       - uses: actions/setup-node@v7
         with:
           node-version: 24
@@ -54,6 +94,33 @@ jobs:
       - name: build binary
         run: |
           python3 setup.py build_binary
+      - name: Verify app binaries can load on macOS 10.14
+        run: |
+          APP=$(ls -d dist/*.app)
+          echo "Scanning $APP"
+          fail=0
+          while IFS= read -r -d '' f; do
+            if ! file "$f" | grep -q "Mach-O"; then
+              continue
+            fi
+            if nm -u "$f" 2>/dev/null | grep -q "ffi_closure_alloc"; then
+              echo "::error::ffi_closure_alloc referenced by $f"
+              fail=1
+            fi
+            minos=$(otool -l "$f" 2>/dev/null | awk '/minos/{print $2; exit} /^ +version /{print $2; exit}')
+            if [ -n "$minos" ]; then
+              higher=$(printf '10.14\n%s\n' "$minos" | sort -V | tail -1)
+              if [ "$higher" != "10.14" ]; then
+                echo "::error::$f requires macOS $minos"
+                fail=1
+              fi
+            fi
+          done < <(find "$APP" -type f -print0)
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::10.14 compatibility gate failed"
+            exit 1
+          fi
+          echo "All app binaries pass the 10.14 gate"
       - name: upload build
         uses: actions/upload-artifact@v7
         with:
